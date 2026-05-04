@@ -120,3 +120,14 @@ add_executable(llama-mtmd-debug debug/mtmd-debug.cpp)
 set_target_properties(llama-mtmd-debug PROPERTIES OUTPUT_NAME llama-mtmd-debug)
 target_link_libraries(llama-mtmd-debug PRIVATE llama-common mtmd Threads::Threads)
 target_compile_features(llama-mtmd-debug PRIVATE cxx_std_17)
+
+
+
+set(TARGET llama-mtmd-custom-cli)
+add_executable         (${TARGET} mtmd-custom-cli.cpp)
+set_target_properties  (${TARGET} PROPERTIES OUTPUT_NAME llama-mtmd-custom-cli) 
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET} RUNTIME)
+endif()
+target_link_libraries  (${TARGET} PRIVATE llama-common mtmd Threads::Threads)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
