@@ -16,8 +16,8 @@ jobs:
       
       - name: Sync with Upstream
         run: |
-          git remote add upstream https://github.com/ggml-org/llama.cpp.git
+          git remote add upstream https://github.com/ggml-org/llama.cpp.git || true
           git fetch upstream
           git checkout master
-          git merge upstream/master
-          git push origin master
+          git reset --hard upstream/master
+          git push --force-with-lease origin master

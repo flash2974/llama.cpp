@@ -10,6 +10,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "../../src/llama-kv-cache.h"
+
 #include <vector>
 #include <limits.h>
 #include <cinttypes>
@@ -228,7 +230,7 @@ static std::string chat_add_and_format(mtmd_cli_context & ctx, common_chat_msg &
     return formatted;
 }
 
-static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
+static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg, int seq_id = 0) {
     bool add_bos = ctx.chat_history.empty();
     auto formatted_chat = chat_add_and_format(ctx, msg);
     LOG_DBG("formatted_chat.prompt: %s\n", formatted_chat.c_str());
@@ -259,7 +261,7 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
                 ctx.lctx, // lctx
                 chunks.ptr.get(), // chunks
                 ctx.n_past, // n_past
-                0, // seq_id
+                seq_id, // seq_id
                 ctx.n_batch, // n_batch
                 true, // logits_last
                 &new_n_past)) {
@@ -376,6 +378,9 @@ int main(int argc, char ** argv) {
         LOG("\n");
 
         std::string content;
+        bool is_first_msg = true;
+        llama_memory_t llama_memory = llama_get_memory(ctx.lctx);
+        // llama_memory_seq_add(llama_memory, 1, ) // ???
 
         while (!g_is_interrupted) {
             g_is_generating = false;
@@ -392,16 +397,22 @@ int main(int argc, char ** argv) {
             if (line == "/quit" || line == "/exit") {
                 break;
             }
-            if (line == "/clear") {
-                ctx.n_past = 0;
-                ctx.chat_history.clear();
-                llama_memory_clear(llama_get_memory(ctx.lctx), true);
-                if (eval_system_prompt_if_present()) {
-                    return 1;
+            if (string_starts_with(line, "/clear")) {
+                if(line == "/clear all") {
+                    ctx.n_past = 0;
+                    ctx.chat_history.clear();
+                    llama_memory_clear(llama_memory, true);
+                    if (eval_system_prompt_if_present()) {
+                        return 1;
+                    }
+                    LOG("Chat history cleared\n\n");
+                    continue;
                 }
-                LOG("Chat history cleared\n\n");
-                continue;
+                else if (line == "/clear dyna") {
+                    llama_memory_seq_rm(llama_memory, 1, -1, -1);
+                }
             }
+
             g_is_generating = true;
             bool is_image = line == "/image" || line.find("/image ") == 0;
             bool is_audio = line == "/audio" || line.find("/audio ") == 0;
@@ -423,7 +434,8 @@ int main(int argc, char ** argv) {
             common_chat_msg msg;
             msg.role = "user";
             msg.content = content;
-            int ret = eval_message(ctx, msg);
+            int ret = eval_message(ctx, msg, !is_first_msg);
+            is_first_msg = false;
             if (ret) {
                 return 1;
             }
