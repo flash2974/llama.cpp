@@ -8,19 +8,23 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      workflows: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT }}
+          fetch-depth: 0
       
       - name: Sync with Upstream
         run: |
+          # Configuration de l'identité
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
           git remote add upstream https://github.com/ggml-org/llama.cpp.git || true
           git fetch upstream
+          
           git checkout master
           git reset --hard upstream/master
-          git push --force-with-lease origin master
+        
+          git push --force origin master
