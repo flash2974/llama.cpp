@@ -9,8 +9,10 @@
 #include "chat.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "pdf-to-img.h"
 
 #include <vector>
+#include <filesystem>
 #include <limits.h>
 #include <cinttypes>
 #include <clocale>
@@ -367,6 +369,7 @@ int main(int argc, char ** argv) {
 
     } else {
         LOG("\n Running in chat mode, available commands:");
+        LOG("\n   /pdf <path>    load pdf");
         if (mtmd_support_vision(ctx.ctx_vision.get())) {
             LOG("\n   /image <path>    load an image");
         }
@@ -420,18 +423,31 @@ int main(int argc, char ** argv) {
             g_is_generating = true;
             bool is_image = line == "/image" || line.find("/image ") == 0;
             bool is_audio = line == "/audio" || line.find("/audio ") == 0;
-            if (is_image || is_audio) {
+            bool is_pdf = line == "/pdf" || line.find("/pdf ") == 0;
+            if (is_image || is_audio || is_pdf) {
                 if (line.size() < 8) {
                     LOG_ERR("ERR: Missing media filename\n");
                     continue;
                 }
-                std::string media_path = line.substr(7);
-                if (ctx.load_media(media_path)) {
+                std::string media_path = line.substr(is_pdf ? 5 : 7);
+                
+                if (is_pdf) {
+                    auto paths_vect = convert_and_move(media_path);
+                    for (const auto& entry : paths_vect) {
+                        std::string fname_str = entry.string();
+                        if (ctx.load_media(fname_str)) {
+                            LOG("PDF page '%s' loaded as image\n", fname_str.c_str());
+                            content += mtmd_default_marker();
+                        }
+                    }
+                }
+                else if (ctx.load_media(media_path)) {
                     LOG("%s %s loaded\n", media_path.c_str(), is_image ? "image" : "audio");
                     content += mtmd_default_marker();
                 }
                 continue;
-            } else {
+            } 
+            else {
                 content += line;
             }
 

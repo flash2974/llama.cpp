@@ -5,25 +5,33 @@
 #include <iostream>
 #include <filesystem>
 #include <string>
+#include <vector>
+#include <algorithm>
 
-namespace fs = std::filesystem;
+using namespace std;
+namespace fs = filesystem;
 
-inline bool string_starts_with(const std::string &s, const std::string &prefix) {
+inline bool string_starts_with(const string &s, const string &prefix) {
 	return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
 }
 
-fs::path run_pdftoppm(const std::string& input_file) {
-    fs::path filepath = fs::path(input_file);
-    std::string prefix = filepath.stem().string();
+fs::path run_pdftoppm(const string& input_file, int resolution) {
+    fs::path filepath = fs::absolute(input_file);
+    fs::path folder = filepath.parent_path();
+    string prefix = filepath.stem().string();
+    
+    string output_prefix = (folder / prefix).string();
     
     pid_t pid = fork();
 
     if (pid == 0) { // Enfant
         const char* args[] = {
-            "pdftoppm", 
+            "pdftoppm",
+            "-r",
+            to_string(resolution).c_str(),
             "-png", 
             input_file.c_str(), 
-            prefix.c_str(), 
+            output_prefix.c_str(), 
             nullptr
         };
         
@@ -41,15 +49,16 @@ fs::path run_pdftoppm(const std::string& input_file) {
     return filepath;
 }
 
-void move_imgs(const fs::path& root, const std::string& prefix) {
+vector<fs::path> move_imgs(const fs::path& root, const string& prefix) {
     fs::path target_dir = root / prefix;
 
     if (!fs::exists(target_dir)) {
         fs::create_directories(target_dir);
     }
 
+    vector<fs::path> entries;
     for (const auto& entry : fs::directory_iterator(root)) {
-        std::string filename = entry.path().filename().string();
+        string filename = entry.path().filename().string();
 
         if (string_starts_with(filename, prefix) && 
             entry.path().extension() == ".png") {
@@ -58,42 +67,59 @@ void move_imgs(const fs::path& root, const std::string& prefix) {
 
             try {
                 fs::rename(entry.path(), destination);
+                entries.push_back(destination);
             } catch (const fs::filesystem_error& e) {
-                std::cerr << "Erreur move : " << e.what() << std::endl;
+                cerr << "Erreur move : " << e.what() << endl;
             }
         }
     }
+    
+    auto get_num = [&prefix](const fs::path& p) {
+        try {
+            std::string stem = p.stem().string(); 
+            std::string str_num = stem.substr(prefix.length() + 1); 
+            return std::stoi(str_num);
+        } catch (...) {
+            return 0;
+        }
+    };
+
+    // 3. Trier les entrées en mémoire avant le déplacement
+    std::sort(entries.begin(), entries.end(), [&](const auto& a, const auto& b) {
+        return get_num(a) < get_num(b);
+    });
+    return entries;
 }
 
-void convert_and_move(const std::string& input_file) {
+vector<fs::path> convert_and_move(const string& input_file) {
     fs::path path_info = run_pdftoppm(input_file);
     
     if (!path_info.empty()) {
-        move_imgs(path_info.parent_path(), path_info.stem().string());
+        return move_imgs(path_info.parent_path(), path_info.stem().string());
     }
 }
 
 int main(int argc, char* argv[]) {
     // 1. Vérification des arguments
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <chemin_du_pdf>" << std::endl;
+        cerr << "Usage: " << argv[0] << " <chemin_du_pdf>" << endl;
         return 1;
     }
 
-    std::string input_pdf = argv[1];
+    string input_pdf = argv[1];
 
     // 2. Vérification de l'existence du fichier
     if (!fs::exists(input_pdf)) {
-        std::cerr << "Erreur : Le fichier '" << input_pdf << "' n'existe pas." << std::endl;
+        cerr << "Erreur : Le fichier '" << input_pdf << "' n'existe pas." << endl;
         return 1;
     }
 
     if (fs::path(input_pdf).extension() != ".pdf") {
-        std::cerr << "Erreur : Le fichier doit être un .pdf" << std::endl;
+        cerr << "Erreur : Le fichier doit être un .pdf" << endl;
         return 1;
     }
 
-    std::cout << "Traitement de : " << input_pdf << "..." << std::endl;
+    cout << "Traitement de : " << input_pdf << "..." << endl;
 
     try {
         // 3. Lancement de la conversion et du déplacement
@@ -101,12 +127,12 @@ int main(int argc, char* argv[]) {
         convert_and_move(input_pdf);
 
         fs::path p(input_pdf);
-        std::cout << "\nSuccès !" << std::endl;
-        std::cout << "Les images ont été placées dans : " 
-                  << (p.parent_path() / p.stem()) << "/" << std::endl;
+        cout << "\nSuccès !" << endl;
+        cout << "Les images ont été placées dans : " 
+                  << (p.parent_path() / p.stem()) << "/" << endl;
     } 
-    catch (const std::exception& e) {
-        std::cerr << "Une erreur est survenue : " << e.what() << std::endl;
+    catch (const exception& e) {
+        cerr << "Une erreur est survenue : " << e.what() << endl;
         return 1;
     }
 
