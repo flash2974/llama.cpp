@@ -10,8 +10,6 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
-#include "../../src/llama-kv-cache.h"
-
 #include <vector>
 #include <limits.h>
 #include <cinttypes>
@@ -91,6 +89,7 @@ struct mtmd_cli_context {
 
     int n_threads    = 1;
     llama_pos n_past = 0;
+    llama_pos n_keep = 0; // fin du prompt statique
 
     common_debug_cb_user_data cb_data;
 
@@ -230,7 +229,7 @@ static std::string chat_add_and_format(mtmd_cli_context & ctx, common_chat_msg &
     return formatted;
 }
 
-static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg, int seq_id = 0) {
+static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
     bool add_bos = ctx.chat_history.empty();
     auto formatted_chat = chat_add_and_format(ctx, msg);
     LOG_DBG("formatted_chat.prompt: %s\n", formatted_chat.c_str());
@@ -261,7 +260,7 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg, int seq_i
                 ctx.lctx, // lctx
                 chunks.ptr.get(), // chunks
                 ctx.n_past, // n_past
-                seq_id, // seq_id
+                0, // seq_id
                 ctx.n_batch, // n_batch
                 true, // logits_last
                 &new_n_past)) {
@@ -339,6 +338,7 @@ int main(int argc, char ** argv) {
     if (eval_system_prompt_if_present()) {
         return 1;
     }
+    ctx.n_keep = ctx.n_past;
 
     if (is_single_turn) {
         g_is_generating = true;
@@ -376,13 +376,24 @@ int main(int argc, char ** argv) {
         LOG("\n   /clear           clear the chat history");
         LOG("\n   /quit or /exit   exit the program");
         LOG("\n");
-
         std::string content;
-        bool is_first_msg = true;
-        llama_memory_t llama_memory = llama_get_memory(ctx.lctx);
-        // llama_memory_seq_add(llama_memory, 1, ) // ???
+        bool is_first_response = true;
+        std::vector<common_chat_msg> keep_chat_history;
 
+        
         while (!g_is_interrupted) {
+            /* autre que 1ere reponse : partie dynamique qui est supprimée a chaque fois
+            KV : [STATIC][DYNAMIC]
+                         ^--------^
+                         partie supprimée à chaque tour   
+            */
+            if (!is_first_response) {
+                // on delete le kv cache entre n_keep et le max (-1)
+                llama_memory_seq_rm(llama_get_memory(ctx.lctx), 0, ctx.n_keep, -1);
+                ctx.n_past = ctx.n_keep;
+                ctx.chat_history = keep_chat_history; 
+            }
+
             g_is_generating = false;
             LOG("\n> ");
             console::set_display(DISPLAY_TYPE_USER_INPUT);
@@ -391,26 +402,19 @@ int main(int argc, char ** argv) {
             if (g_is_interrupted) break;
             console::set_display(DISPLAY_TYPE_RESET);
             line = string_strip(line);
-            if (line.empty()) {
+            
+            if (line.empty()) continue;
+            if (line == "/quit" || line == "/exit") break;
+            
+            if (line == "/clear") {
+                ctx.n_past = 0;
+                ctx.chat_history.clear();
+                llama_memory_clear(llama_get_memory(ctx.lctx), true);
+                if (eval_system_prompt_if_present()) return 1;
+                ctx.n_keep = ctx.n_past;
+                is_first_response = true;
+                LOG("Chat history cleared\n\n");
                 continue;
-            }
-            if (line == "/quit" || line == "/exit") {
-                break;
-            }
-            if (string_starts_with(line, "/clear")) {
-                if(line == "/clear all") {
-                    ctx.n_past = 0;
-                    ctx.chat_history.clear();
-                    llama_memory_clear(llama_memory, true);
-                    if (eval_system_prompt_if_present()) {
-                        return 1;
-                    }
-                    LOG("Chat history cleared\n\n");
-                    continue;
-                }
-                else if (line == "/clear dyna") {
-                    llama_memory_seq_rm(llama_memory, 1, -1, -1);
-                }
             }
 
             g_is_generating = true;
@@ -426,23 +430,28 @@ int main(int argc, char ** argv) {
                     LOG("%s %s loaded\n", media_path.c_str(), is_image ? "image" : "audio");
                     content += mtmd_default_marker();
                 }
-                // else, error is already printed by libmtmd
                 continue;
             } else {
                 content += line;
             }
+
             common_chat_msg msg;
             msg.role = "user";
             msg.content = content;
-            int ret = eval_message(ctx, msg, !is_first_msg);
-            is_first_msg = false;
-            if (ret) {
-                return 1;
-            }
+            
+            int ret = eval_message(ctx, msg);
+            if (ret) return 1;
             if (g_is_interrupted) break;
-            if (generate_response(ctx, n_predict)) {
-                return 1;
+            
+            if (generate_response(ctx, n_predict)) return 1; 
+
+            // le premier prompt est le prompt "statique"
+            if (is_first_response) {
+                ctx.n_keep = ctx.n_past;                // on save la taille du KV cache
+                keep_chat_history = ctx.chat_history;   // et aussi l'historique
+                is_first_response = false;
             }
+
             content.clear();
         }
     }
