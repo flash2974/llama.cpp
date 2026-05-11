@@ -17,6 +17,10 @@
 #include <limits.h>
 #include <cinttypes>
 #include <clocale>
+#include <nlohmann/json.hpp>
+#include <iomanip>
+#include <iostream>
+
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -33,6 +37,7 @@
 // volatile, because of signal being an interrupt
 static volatile bool g_is_generating = false;
 static volatile bool g_is_interrupted = false;
+using ordered_json = nlohmann::ordered_json;
 
 /**
  * Please note that this is NOT a production-ready stuff.
@@ -179,7 +184,61 @@ struct mtmd_cli_context {
     }
 };
 
-static int generate_response(mtmd_cli_context & ctx, int n_predict) {
+void parse_json(std::string content) {
+    size_t start = content.find_first_of('{');
+    size_t end = content.find_last_of('}');
+
+    if (start != std::string::npos && end != std::string::npos && end >= start) {
+        content = content.substr(start, end - start + 1);
+    } else {
+        std::cerr << "[Erreur JSON] Aucun objet JSON détecté dans la réponse.\n";
+        std::cerr << "Texte brut :\n" << content << "\n";
+        return;
+    }
+
+    try {
+        ordered_json document = ordered_json::parse(content);
+        
+        if (document.contains("understanding")) {
+            std::string analyse = document["understanding"].get<std::string>();
+            std::cout << "Analyse du modèle : " << analyse << "\n\n";
+        }
+
+        if (document.contains("table")) {
+            std::cout << std::left 
+                      << std::setw(6)  << "Ex" 
+                      << "| " << std::setw(6) << "Note" 
+                      << "| Commentaire\n";
+            std::cout << "--------------------------------------------------------\n";
+
+            int student_grade{}, total_grade{};
+
+            for (const auto& [nom_exo, data] : document["table"].items()) {
+                std::string note = data.value("grade", "N/A");
+                if (note != "N/A") {
+                    int n, t;
+                    if (sscanf(note.c_str(), "%d/%d", &n, &t) == 2) {
+                        student_grade += n;
+                        total_grade += t;
+                    }
+                }
+                std::string commentaire = data.value("comment", "");
+
+                std::cout << std::left 
+                          << std::setw(6)  << nom_exo 
+                          << "| " << std::setw(6) << note 
+                          << "| " << commentaire << "\n";
+            }
+            std::cout << "\nNote finale : " << student_grade << "/" << total_grade << "(" << (student_grade * 20) / total_grade << "/20)\n";
+        }
+
+    } catch (const nlohmann::json::exception& e) {
+        std::cerr << "[Erreur JSON] Impossible de parser le texte : " << e.what() << "\n";
+    }
+}
+
+
+static int generate_response(mtmd_cli_context & ctx, int n_predict, bool json_out = false) {
     llama_tokens generated_tokens;
     for (int i = 0; i < n_predict; i++) {
         if (i > n_predict || !g_is_generating || g_is_interrupted) {
@@ -218,6 +277,8 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
     msg.role    = "assistant";
     msg.content = generated_text;
     ctx.chat_history.push_back(std::move(msg));
+
+    if(json_out) parse_json(generated_text);
 
     return 0;
 }
@@ -260,13 +321,13 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
 
     llama_pos new_n_past;
     if (mtmd_helper_eval_chunks(ctx.ctx_vision.get(),
-                ctx.lctx, // lctx
-                chunks.ptr.get(), // chunks
-                ctx.n_past, // n_past
-                0, // seq_id
-                ctx.n_batch, // n_batch
-                true, // logits_last
-                &new_n_past)) {
+        ctx.lctx,         // lctx
+        chunks.ptr.get(), // chunks
+        ctx.n_past,       // n_past
+        0,                // seq_id
+        ctx.n_batch,      // n_batch
+        true,             // logits_last
+        &new_n_past)) {
         LOG_ERR("Unable to eval prompt\n");
         return 1;
     }
@@ -301,8 +362,6 @@ int main(int argc, char ** argv) {
 
     mtmd_cli_context ctx(params);
     LOG_INF("%s: loading model: %s\n", __func__, params.model.path.c_str());
-
-    bool is_single_turn = !params.prompt.empty() && !params.image.empty();
 
     int n_predict = params.n_predict < 0 ? INT_MAX : params.n_predict;
 
@@ -343,169 +402,147 @@ int main(int argc, char ** argv) {
     }
     ctx.n_keep = ctx.n_past;
 
-    if (is_single_turn) {
+    bool json_out = string_starts_with(params.sampling.grammar.grammar, "#custom");
+
+    LOG("%s\n", params.sampling.grammar.grammar.c_str());
+
+    LOG("\n Running in chat mode, available commands:");
+    LOG("\n   /pdf <path>    load pdf");
+    LOG("\n   /txt <path>    load txt");
+    if (mtmd_support_vision(ctx.ctx_vision.get())) {
+        LOG("\n   /image <path>    load an image");
+    }
+    if (mtmd_support_audio(ctx.ctx_vision.get())) {
+        LOG("\n   /audio <path>    load an audio");
+    }
+    LOG("\n   /clear           clear the chat history");
+    LOG("\n   /quit or /exit   exit the program");
+    LOG("\n");
+    std::string content;
+    bool is_first_response = true;
+    std::vector<common_chat_msg> keep_chat_history;
+
+    
+    while (!g_is_interrupted) {
+        /* autre que 1ere reponse : partie dynamique qui est supprimée a chaque fois
+        KV : [STATIC][DYNAMIC]
+                        ^--------^
+                        partie supprimée à chaque tour   
+        */
+        if (!is_first_response) {
+            // on delete le kv cache entre n_keep et le max (-1)
+            llama_memory_seq_rm(llama_get_memory(ctx.lctx), 0, ctx.n_keep, -1);
+            ctx.n_past = ctx.n_keep;
+            ctx.chat_history = keep_chat_history; 
+        }
+
+        g_is_generating = false;
+        LOG("\n> ");
+        console::set_display(DISPLAY_TYPE_USER_INPUT);
+        std::string line;
+        console::readline(line, false);
+        if (g_is_interrupted) break;
+        console::set_display(DISPLAY_TYPE_RESET);
+        line = string_strip(line);
+        
+        if (line.empty()) continue;
+        if (line == "/quit" || line == "/exit") break;
+        
+        if (line == "/clear") {
+            ctx.n_past = 0;
+            ctx.chat_history.clear();
+            llama_memory_clear(llama_get_memory(ctx.lctx), true);
+            if (eval_system_prompt_if_present()) return 1;
+            ctx.n_keep = ctx.n_past;
+            is_first_response = true;
+            common_sampler_free(ctx.smpl);
+            ctx.smpl = common_sampler_init(ctx.model, params.sampling);
+            LOG("Chat history cleared\n\n");
+            continue;
+        }
+
         g_is_generating = true;
-        if (params.prompt.find(mtmd_default_marker()) == std::string::npos) {
-            for (size_t i = 0; i < params.image.size(); i++) {
-                // most models require the marker before each image
-                // ref: https://github.com/ggml-org/llama.cpp/pull/17616
-                params.prompt = mtmd_default_marker() + params.prompt;
+        bool is_image = line == "/image" || line.find("/image ") == 0;
+        bool is_audio = line == "/audio" || line.find("/audio ") == 0;
+        bool is_pdf   = line == "/pdf"   || line.find("/pdf ")   == 0;
+        bool is_txt   = line == "/txt"   || line.find("/txt ")   == 0;
+        
+        if (is_image || is_audio || is_pdf || is_txt) {
+            size_t prefix_len = (is_pdf || is_txt) ? 5 : 7;
+            
+            if (line.size() <= prefix_len) {
+                LOG_ERR("ERR: Missing media filename\n");
+                continue;
             }
+            
+            std::string media_path = string_strip(line.substr(prefix_len));
+
+            if (is_txt) {
+                std::ifstream ifs(media_path);
+                if (!ifs.is_open()) {
+                    LOG_ERR("ERR: Impossible de lire le fichier texte '%s'\n", media_path.c_str());
+                } else {
+                    std::stringstream buffer;
+                    buffer << ifs.rdbuf();
+                    content = "Maintenant, voila la réponse d'un étudiant. Tu dois utiliser OBLIGATOIREMENT la clé \"table\". Pour chaque question trouvée, crée une clé au format \"Ex01\", \"Ex02\". Pour chaque question, l'objet doit contenir deux clés : \"grade\" et \"comment\". Pour la clé \"grade\" : Évalue l'exercice et donne une note. ATTENTION : Tu n'as le droit que d'utiliser soit des tiers (0/3, 1/3, 2/3, 3/3), soit des quarts (0/4, 1/4, 2/4, 3/4, 4/4). Choisis le ratio qui te semble le plus adapté à la qualité de la réponse. Pour la clé \"comment\" : Donne un commentaire bref mais clair sur l'exercice en question. N'oublie pas de faire TOUTES les réponses aux questions. Voici la réponse de l'étudiant :\n" + buffer.str();
+                    
+                    LOG("Text file '%s' loaded (%zu bytes)\n", media_path.c_str(), buffer.str().size());
+                }
+            }
+            else if (is_pdf) {
+                auto paths_vect = convert_and_move(media_path);
+                if (paths_vect.empty()) {
+                    LOG_ERR("ERR: Impossible de convertir le PDF ou fichier introuvable : '%s'\n", media_path.c_str());
+                }
+                
+                for (const auto& entry : paths_vect) {
+                    std::string fname_str = entry.string();
+                    if (ctx.load_media(fname_str)) {
+                        LOG("PDF page '%s' loaded as image\n", fname_str.c_str());
+                        content += mtmd_default_marker(); 
+                    } else {
+                        LOG_ERR("ERR: Echec du chargement de l'image '%s'\n", fname_str.c_str());
+                    }
+                }
+                content = "Tu es un professeur de C++ très exigeant. Tu t'apprêtes à corriger des copies. Voici le sujet de l'examen :\n" 
+                            + content + 
+                            "\nAnalyse ce document pour t'en imprégner. Réponds en une seule phrase rapide avec la clé \"understanding\".";
+            }
+            else if (ctx.load_media(media_path)) {
+                LOG("%s %s loaded\n", media_path.c_str(), is_image ? "image" : "audio");
+                content += mtmd_default_marker();
+            } else {
+                LOG_ERR("ERR: Echec du chargement du media '%s'\n", media_path.c_str());
+            }
+            // continue; // si on veut taper le prompt apres l'injection du texte
+        }
+        else {
+            content += line;
         }
 
         common_chat_msg msg;
         msg.role = "user";
-        msg.content = params.prompt;
-        for (const auto & image : params.image) {
-            if (!ctx.load_media(image)) {
-                return 1; // error is already printed by libmtmd
-            }
-        }
-        if (eval_message(ctx, msg)) {
-            return 1;
-        }
-        if (!g_is_interrupted && generate_response(ctx, n_predict)) {
-            return 1;
-        }
-
-    } else {
-        LOG("\n Running in chat mode, available commands:");
-        LOG("\n   /pdf <path>    load pdf");
-        if (mtmd_support_vision(ctx.ctx_vision.get())) {
-            LOG("\n   /image <path>    load an image");
-        }
-        if (mtmd_support_audio(ctx.ctx_vision.get())) {
-            LOG("\n   /audio <path>    load an audio");
-        }
-        LOG("\n   /clear           clear the chat history");
-        LOG("\n   /quit or /exit   exit the program");
-        LOG("\n");
-        std::string content;
-        bool is_first_response = true;
-        std::vector<common_chat_msg> keep_chat_history;
-
+        msg.content = content;
         
-        while (!g_is_interrupted) {
-            /* autre que 1ere reponse : partie dynamique qui est supprimée a chaque fois
-            KV : [STATIC][DYNAMIC]
-                         ^--------^
-                         partie supprimée à chaque tour   
-            */
-            if (!is_first_response) {
-                // on delete le kv cache entre n_keep et le max (-1)
-                llama_memory_seq_rm(llama_get_memory(ctx.lctx), 0, ctx.n_keep, -1);
-                ctx.n_past = ctx.n_keep;
-                ctx.chat_history = keep_chat_history; 
-            }
+        int ret = eval_message(ctx, msg);
+        if (ret) return 1;
+        if (g_is_interrupted) break;
 
-            g_is_generating = false;
-            LOG("\n> ");
-            console::set_display(DISPLAY_TYPE_USER_INPUT);
-            std::string line;
-            console::readline(line, false);
-            if (g_is_interrupted) break;
-            console::set_display(DISPLAY_TYPE_RESET);
-            line = string_strip(line);
-            
-            if (line.empty()) continue;
-            if (line == "/quit" || line == "/exit") break;
-            
-            if (line == "/clear") {
-                ctx.n_past = 0;
-                ctx.chat_history.clear();
-                llama_memory_clear(llama_get_memory(ctx.lctx), true);
-                if (eval_system_prompt_if_present()) return 1;
-                ctx.n_keep = ctx.n_past;
-                is_first_response = true;
-                common_sampler_free(ctx.smpl);
-                ctx.smpl = common_sampler_init(ctx.model, params.sampling);
-                LOG("Chat history cleared\n\n");
-                continue;
-            }
+        /* a chaque nouveau prompt, on reset le sampler : le fichier de grammaire ayant 
+        été "utilisé", on le réinjecte au modèle pour qu'il réponde à nouveau selon GBNF */
+        common_sampler_free(ctx.smpl);
+        ctx.smpl = common_sampler_init(ctx.model, params.sampling);
 
-            g_is_generating = true;
-            bool is_image = line == "/image" || line.find("/image ") == 0;
-            bool is_audio = line == "/audio" || line.find("/audio ") == 0;
-            bool is_pdf   = line == "/pdf"   || line.find("/pdf ")   == 0;
-            bool is_txt   = line == "/txt"   || line.find("/txt ")   == 0;
-            
-            if (is_image || is_audio || is_pdf || is_txt) {
-                size_t prefix_len = (is_pdf || is_txt) ? 5 : 7;
-                
-                if (line.size() <= prefix_len) {
-                    LOG_ERR("ERR: Missing media filename\n");
-                    continue;
-                }
-                
-                std::string media_path = string_strip(line.substr(prefix_len));
+        if (generate_response(ctx, n_predict, json_out)) return 1;
 
-                if (is_txt) {
-                    std::ifstream ifs(media_path);
-                    if (!ifs.is_open()) {
-                        LOG_ERR("ERR: Impossible de lire le fichier texte '%s'\n", media_path.c_str());
-                    } else {
-                        std::stringstream buffer;
-                        buffer << ifs.rdbuf();
-                        content = "Maintenant, voila la réponse d'un étudiant. Tu dois utiliser OBLIGATOIREMENT la clé \"table\". Pour chaque question trouvée, crée une clé au format \"Ex01\", \"Ex02\". Pour chaque question, l'objet doit contenir deux clés : \"grade\" et \"comment\". Pour la clé \"grade\" : Évalue l'exercice et donne une note. ATTENTION : Tu n'as le droit que d'utiliser soit des tiers (0/3, 1/3, 2/3, 3/3), soit des quarts (0/4, 1/4, 2/4, 3/4, 4/4). Choisis le ratio qui te semble le plus adapté à la taille de l'exercice. Pour la clé \"comment\" : Donne un commentaire bref mais clair sur l'exercice en question. N'oublie pas de faire TOUTES les réponses aux questions. Voici la réponse de l'étudiant :\n" + buffer.str();
-                        
-                        LOG("Text file '%s' loaded (%zu bytes)\n", media_path.c_str(), buffer.str().size());
-                    }
-                }
-                else if (is_pdf) {
-                    auto paths_vect = convert_and_move(media_path);
-                    if (paths_vect.empty()) {
-                        LOG_ERR("ERR: Impossible de convertir le PDF ou fichier introuvable : '%s'\n", media_path.c_str());
-                    }
-                    
-                    for (const auto& entry : paths_vect) {
-                        std::string fname_str = entry.string();
-                        if (ctx.load_media(fname_str)) {
-                            LOG("PDF page '%s' loaded as image\n", fname_str.c_str());
-                            content += mtmd_default_marker(); 
-                        } else {
-                            LOG_ERR("ERR: Echec du chargement de l'image '%s'\n", fname_str.c_str());
-                        }
-                    }
-                    content = "Tu es un professeur de C++ très exigeant. Tu t'apprêtes à corriger des copies. Voici le sujet de l'examen :\n" 
-                              + content + 
-                              "\nAnalyse ce document pour t'en imprégner. Réponds en une seule phrase rapide avec la clé \"understanding\".";
-                }
-                else if (ctx.load_media(media_path)) {
-                    LOG("%s %s loaded\n", media_path.c_str(), is_image ? "image" : "audio");
-                    content += mtmd_default_marker();
-                } else {
-                    LOG_ERR("ERR: Echec du chargement du media '%s'\n", media_path.c_str());
-                }
-                // continue; // si on veut taper le prompt apres l'injection du texte
-            }
-            else {
-                content += line;
-            }
-
-            common_chat_msg msg;
-            msg.role = "user";
-            msg.content = content;
-            
-            int ret = eval_message(ctx, msg);
-            if (ret) return 1;
-            if (g_is_interrupted) break;
-
-            /* a chaque nouveau prompt, on reset le sampler : le fichier de grammaire ayant 
-            été "utilisé", on le réinjecte au modèle pour qu'il réponde à nouveau selon GBNF */
-            common_sampler_free(ctx.smpl);
-            ctx.smpl = common_sampler_init(ctx.model, params.sampling);
-
-            if (generate_response(ctx, n_predict)) return 1;
-
-            // le premier prompt est le prompt "statique"
-            if (is_first_response) {
-                ctx.n_keep = ctx.n_past;                // on save la taille du KV cache
-                keep_chat_history = ctx.chat_history;   // et aussi l'historique
-                is_first_response = false;
-            }
-
-            content.clear();
+        // le premier prompt est le prompt "statique"
+        if (is_first_response) {
+            ctx.n_keep = ctx.n_past;                // on save la taille du KV cache
+            keep_chat_history = ctx.chat_history;   // et aussi l'historique
+            is_first_response = false;
         }
+
+        content.clear();
     }
     if (g_is_interrupted) LOG("\nInterrupted by user\n");
     LOG("\n\n");

@@ -1,3 +1,4 @@
+#custom
 root ::= "{" ws ( understanding-kv | table-kv ) ws "}"
 understanding-kv ::= "\"understanding\"" ws ":" ws string
 table-kv ::= "\"table\"" ws ":" ws "{" ws table-items ws "}"
