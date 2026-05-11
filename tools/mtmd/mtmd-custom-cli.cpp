@@ -10,7 +10,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "pdf-to-img.h"
-
+#include <fstream>
+#include <sstream>
 #include <vector>
 #include <filesystem>
 #include <limits.h>
@@ -416,6 +417,8 @@ int main(int argc, char ** argv) {
                 if (eval_system_prompt_if_present()) return 1;
                 ctx.n_keep = ctx.n_past;
                 is_first_response = true;
+                common_sampler_free(ctx.smpl);
+                ctx.smpl = common_sampler_init(ctx.model, params.sampling);
                 LOG("Chat history cleared\n\n");
                 continue;
             }
@@ -423,30 +426,58 @@ int main(int argc, char ** argv) {
             g_is_generating = true;
             bool is_image = line == "/image" || line.find("/image ") == 0;
             bool is_audio = line == "/audio" || line.find("/audio ") == 0;
-            bool is_pdf = line == "/pdf" || line.find("/pdf ") == 0;
-            if (is_image || is_audio || is_pdf) {
-                if (line.size() < 8) {
+            bool is_pdf   = line == "/pdf"   || line.find("/pdf ")   == 0;
+            bool is_txt   = line == "/txt"   || line.find("/txt ")   == 0;
+            
+            if (is_image || is_audio || is_pdf || is_txt) {
+                size_t prefix_len = (is_pdf || is_txt) ? 5 : 7;
+                
+                if (line.size() <= prefix_len) {
                     LOG_ERR("ERR: Missing media filename\n");
                     continue;
                 }
-                std::string media_path = line.substr(is_pdf ? 5 : 7);
                 
-                if (is_pdf) {
+                std::string media_path = string_strip(line.substr(prefix_len));
+
+                if (is_txt) {
+                    std::ifstream ifs(media_path);
+                    if (!ifs.is_open()) {
+                        LOG_ERR("ERR: Impossible de lire le fichier texte '%s'\n", media_path.c_str());
+                    } else {
+                        std::stringstream buffer;
+                        buffer << ifs.rdbuf();
+                        content = "Maintenant, voila la réponse d'un étudiant. Tu dois utiliser OBLIGATOIREMENT la clé \"table\". Pour chaque question trouvée, crée une clé au format \"Ex01\", \"Ex02\". Pour chaque question, l'objet doit contenir deux clés : \"grade\" et \"comment\". Pour la clé \"grade\" : Évalue l'exercice et donne une note. ATTENTION : Tu n'as le droit que d'utiliser soit des tiers (0/3, 1/3, 2/3, 3/3), soit des quarts (0/4, 1/4, 2/4, 3/4, 4/4). Choisis le ratio qui te semble le plus adapté à la taille de l'exercice. Pour la clé \"comment\" : Donne un commentaire bref mais clair sur l'exercice en question. N'oublie pas de faire TOUTES les réponses aux questions. Voici la réponse de l'étudiant :\n" + buffer.str();
+                        
+                        LOG("Text file '%s' loaded (%zu bytes)\n", media_path.c_str(), buffer.str().size());
+                    }
+                }
+                else if (is_pdf) {
                     auto paths_vect = convert_and_move(media_path);
+                    if (paths_vect.empty()) {
+                        LOG_ERR("ERR: Impossible de convertir le PDF ou fichier introuvable : '%s'\n", media_path.c_str());
+                    }
+                    
                     for (const auto& entry : paths_vect) {
                         std::string fname_str = entry.string();
                         if (ctx.load_media(fname_str)) {
                             LOG("PDF page '%s' loaded as image\n", fname_str.c_str());
-                            content += mtmd_default_marker();
+                            content += mtmd_default_marker(); 
+                        } else {
+                            LOG_ERR("ERR: Echec du chargement de l'image '%s'\n", fname_str.c_str());
                         }
                     }
+                    content = "Tu es un professeur de C++ très exigeant. Tu t'apprêtes à corriger des copies. Voici le sujet de l'examen :\n" 
+                              + content + 
+                              "\nAnalyse ce document pour t'en imprégner. Réponds en une seule phrase rapide avec la clé \"understanding\".";
                 }
                 else if (ctx.load_media(media_path)) {
                     LOG("%s %s loaded\n", media_path.c_str(), is_image ? "image" : "audio");
                     content += mtmd_default_marker();
+                } else {
+                    LOG_ERR("ERR: Echec du chargement du media '%s'\n", media_path.c_str());
                 }
-                continue;
-            } 
+                // continue; // si on veut taper le prompt apres l'injection du texte
+            }
             else {
                 content += line;
             }
@@ -458,8 +489,13 @@ int main(int argc, char ** argv) {
             int ret = eval_message(ctx, msg);
             if (ret) return 1;
             if (g_is_interrupted) break;
-            
-            if (generate_response(ctx, n_predict)) return 1; 
+
+            /* a chaque nouveau prompt, on reset le sampler : le fichier de grammaire ayant 
+            été "utilisé", on le réinjecte au modèle pour qu'il réponde à nouveau selon GBNF */
+            common_sampler_free(ctx.smpl);
+            ctx.smpl = common_sampler_init(ctx.model, params.sampling);
+
+            if (generate_response(ctx, n_predict)) return 1;
 
             // le premier prompt est le prompt "statique"
             if (is_first_response) {
