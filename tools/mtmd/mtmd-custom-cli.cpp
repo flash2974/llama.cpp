@@ -229,7 +229,7 @@ void parse_json(std::string content) {
                           << "| " << std::setw(6) << note 
                           << "| " << commentaire << "\n";
             }
-            std::cout << "\nNote finale : " << student_grade << "/" << total_grade << "(" << (student_grade * 20) / total_grade << "/20)\n";
+            std::cout << "\nNote finale : " << student_grade << "/" << total_grade << " (" << (student_grade * 20) / total_grade << "/20)\n";
         }
 
     } catch (const nlohmann::json::exception& e) {
@@ -337,6 +337,31 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
     LOG("\n");
 
     return 0;
+}
+
+std::string loadStudent(const std::string& path) {
+    std::string result{};
+    try {
+        if (std::filesystem::exists(path) && std::filesystem::is_directory(path)) {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(path)) {
+                std::ifstream ifs(entry.path());
+                std::stringstream buffer;
+                buffer << ifs.rdbuf();
+                if (std::filesystem::is_regular_file(entry)) {
+                    std::string relative_name = entry.path().lexically_relative(path).c_str();
+                    const bool is_theory = entry.path().extension() == ".txt";
+                    const std::string section = is_theory ? "THEORIE" : "PRATIQUE";
+                    result = result + "######BEGIN FILE [" + section + "] \"" + relative_name + "\"\n" + buffer.str() + "\n######END FILE [" + section + "] \"" + relative_name + "\"\n";
+                    std::cout << "Loaded " << relative_name << std::endl;
+                }
+            }
+        } else {
+            std::cerr << "Le chemin spécifié n'existe pas ou n'est pas un dossier." << std::endl;
+        }
+    } catch (const std::filesystem::filesystem_error& e) {
+        std::cerr << "Erreur : " << e.what() << std::endl;
+    }
+    return result;
 }
 
 int main(int argc, char ** argv) {
@@ -466,8 +491,14 @@ int main(int argc, char ** argv) {
         bool is_audio = line == "/audio" || line.find("/audio ") == 0;
         bool is_pdf   = line == "/pdf"   || line.find("/pdf ")   == 0;
         bool is_txt   = line == "/txt"   || line.find("/txt ")   == 0;
+        bool is_student   = line == "/student"   || line.find("/student ")   == 0;
+
+        if(is_student) {
+            std::string dir_exam_student = string_strip(line.substr(9));
+            content = "Maintenant, voila la réponse d'un étudiant. Tu dois utiliser OBLIGATOIREMENT la clé \"table\". Pour chaque question du sujet original, crée une clé au format \"x.y.z\". \"x\" représente la partie (1 ou 2), \"y\" le numéro d'exercice, et \"z\" le numéro de la question (01, 02, etc). La partie pratique n'est pas optionnelle : si la copie contient des fichiers marqués [PRATIQUE], tu dois corriger tous les exercices pratiques, pas seulement un sous-ensemble. Dans cette copie, attends-toi à au moins 4 exercices pratiques et à au moins 20 questions au total : ta table finale doit donc être exhaustive et ne doit pas s'arrêter après quelques lignes. Si l'étudiant n'a pas répondu ou que tu ne trouve pas la réponse, affiche \"no_response\". Pour chaque question, l'objet doit contenir deux clés : \"grade\" et \"comment\". Pour la clé \"grade\" : Évalue la question et donne une note. ATTENTION : Tu n'as le droit que d'utiliser soit des tiers (0/3, 1/3, 2/3, 3/3), soit des quarts (0/4, 1/4, 2/4, 3/4, 4/4). Choisis le ratio qui te semble le plus adapté à la qualité de la réponse. Pour la clé \"comment\" : Donne un commentaire bref mais clair sur la réponse de l'étudiant à ladite question. ATTENTION : l'examen est découpé entre une première partie théorique (fichier texte qui contient les questions 1 à 5), et une partie pratique (du code C++). La partie pratique doit être corrigée au même titre que la théorie. N'arrête pas ton analyse après les questions théoriques : parcours aussi tous les fichiers marqués [PRATIQUE] et couvre tous les exercices et questions du code C++. Voici les réponses de l'étudiant :\n" + loadStudent(dir_exam_student);
+        }
         
-        if (is_image || is_audio || is_pdf || is_txt) {
+        else if (is_image || is_audio || is_pdf || is_txt) {
             size_t prefix_len = (is_pdf || is_txt) ? 5 : 7;
             
             if (line.size() <= prefix_len) {
