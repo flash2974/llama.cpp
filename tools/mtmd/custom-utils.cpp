@@ -58,7 +58,7 @@ string loadStudent(const string& path) {
 }
 
 void parse_json(string content) {
-    size_t start = content.find_first_of('{');
+    size_t start = content.find_last_of("<channel|>") + 1;
     size_t end = content.find_last_of('}');
 
     if (start != string::npos && end != string::npos && end >= start) {

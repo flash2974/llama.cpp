@@ -505,14 +505,8 @@ int main(int argc, char ** argv) {
 
         if(is_student) {
             std::string dir_exam_student = string_strip(line.substr(9));
-            content = "Corrige chaque question de l'examen. "
-                      "Chaque question (au format x.y.zz que tu connais deja) est une clé contenant :"
-                      "- une clé \"grade\" : une note pour la question (ratio 0/3 à 3/3 ou 0/4 à 4/4). "
-                      "- une clé \"points\", qui est le nombre de points de l'exercice (de la consigne, tu l'avais noté au prompt précédent)"
-                      "- une clé \"comment\" : un commentaire sur la question.\n"
-                      "Voici la copie :\n" + loadStudent(dir_exam_student) +
-                      "\n\nRÈGLE FORMAT : Réfléchis étape par étape pour chaque question. Quand tu as fini de corriger, écris le symbole ~ puis génère ton JSON strict avec la clé \"table\"."
-                      "\nExemple :\n<tes pensées...>\n~\n{\"table\": {\"1.0.01\": {\"grade\": \"...\", \"points\": \"...\", \"comment\": \"...\"}}}";
+            content += loadStudent(dir_exam_student);
+            continue;
         }
         
         else if (is_image || is_audio || is_pdf || is_txt) {
@@ -552,15 +546,6 @@ int main(int argc, char ** argv) {
                         LOG_ERR("ERR: Echec du chargement de l'image '%s'\n", fname_str.c_str());
                     }
                 }
-                content = "Tu t'apprêtes à corriger des copies. Voici le sujet de l'examen :\n" 
-                            + content + 
-                            "\nAnalyse ce document avec la plus grande attention et identifie TOUTES les questions pour lesquelles l'étudiant devra fournir une réponse.\n"
-                            "génère un JSON avec UNIQUEMENT la clé \"understanding\".\n"
-                            "La clé \"understanding\" doit être un dictionnaire où chaque clé est l'identifiant de la question au format x.y.zz -> x le numéro de partie selon l'ordre (ex: théorique =1, pratique = 2), y le numéro d'exercice, zz le numéro de question. ex: \"1.0.01\", et la valeur est un objet contenant \"title\" (Partie et Exercice), \"points\" (le nombre en format texte, ex: \"1.5\"), et \"resume\" (un bref résumé des attendus).\n"
-                            "Exemple attendu :\n"
-                            "<tes pensées...>\n"
-                            "~\n"
-                            "{\"understanding\": {\"1.0.01\": {\"title\": \"Partie 1 - Question 01\", \"points\": \"1.5\", \"resume\": \"Concept de polymorphisme\"}}}";
             }
             else if (ctx.load_media(media_path)) {
                 LOG("%s %s loaded\n", media_path.c_str(), is_image ? "image" : "audio");
@@ -568,7 +553,7 @@ int main(int argc, char ** argv) {
             } else {
                 LOG_ERR("ERR: Echec du chargement du media '%s'\n", media_path.c_str());
             }
-            // continue; // si on veut taper le prompt apres l'injection du texte
+            continue; // si on veut taper le prompt apres l'injection du texte
         }
         else {
             content += line;
