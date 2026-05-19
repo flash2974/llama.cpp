@@ -11,6 +11,8 @@ add_library(mtmd
             mtmd-helper.h
             pdf-to-img.cpp
             pdf-to-img.h
+            custom-utils.cpp
+            custom-utils.h
             clip.cpp
             clip.h
             clip-impl.h

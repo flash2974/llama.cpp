@@ -10,17 +10,17 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "pdf-to-img.h"
+#include "custom-utils.h"
+
 #include <fstream>
 #include <sstream>
 #include <vector>
-#include <filesystem>
+#include <string>
 #include <limits.h>
 #include <cinttypes>
 #include <clocale>
-#include <nlohmann/json.hpp>
 #include <iomanip>
 #include <iostream>
-
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -37,7 +37,6 @@
 // volatile, because of signal being an interrupt
 static volatile bool g_is_generating = false;
 static volatile bool g_is_interrupted = false;
-using ordered_json = nlohmann::ordered_json;
 
 /**
  * Please note that this is NOT a production-ready stuff.
@@ -150,8 +149,9 @@ struct mtmd_cli_context {
         mparams.n_threads        = params.cpuparams.n_threads;
         mparams.flash_attn_type  = params.flash_attn_type;
         mparams.warmup           = params.warmup;
-        mparams.image_min_tokens = params.image_min_tokens;
-        mparams.image_max_tokens = params.image_max_tokens;
+        
+        mparams.image_min_tokens = 1120;
+        mparams.image_max_tokens = 1120;
         if (std::getenv("MTMD_DEBUG_GRAPH") != nullptr) {
             mparams.cb_eval_user_data = &cb_data;
             mparams.cb_eval = common_debug_cb_eval;
@@ -183,59 +183,6 @@ struct mtmd_cli_context {
         return true;
     }
 };
-
-void parse_json(std::string content) {
-    size_t start = content.find_first_of('{');
-    size_t end = content.find_last_of('}');
-
-    if (start != std::string::npos && end != std::string::npos && end >= start) {
-        content = content.substr(start, end - start + 1);
-    } else {
-        std::cerr << "[Erreur JSON] Aucun objet JSON détecté dans la réponse.\n";
-        std::cerr << "Texte brut :\n" << content << "\n";
-        return;
-    }
-
-    try {
-        ordered_json document = ordered_json::parse(content);
-        
-        if (document.contains("understanding")) {
-            std::string analyse = document["understanding"].get<std::string>();
-            std::cout << "Analyse du modèle : " << analyse << "\n\n";
-        }
-
-        if (document.contains("table")) {
-            std::cout << std::left 
-                      << std::setw(6)  << "Ex" 
-                      << "| " << std::setw(6) << "Note" 
-                      << "| Commentaire\n";
-            std::cout << "--------------------------------------------------------\n";
-
-            int student_grade{}, total_grade{};
-
-            for (const auto& [nom_exo, data] : document["table"].items()) {
-                std::string note = data.value("grade", "N/A");
-                if (note != "N/A") {
-                    int n, t;
-                    if (sscanf(note.c_str(), "%d/%d", &n, &t) == 2) {
-                        student_grade += n;
-                        total_grade += t;
-                    }
-                }
-                std::string commentaire = data.value("comment", "");
-
-                std::cout << std::left 
-                          << std::setw(6)  << nom_exo 
-                          << "| " << std::setw(6) << note 
-                          << "| " << commentaire << "\n";
-            }
-            std::cout << "\nNote finale : " << student_grade << "/" << total_grade << " (" << (student_grade * 20) / total_grade << "/20)\n";
-        }
-
-    } catch (const nlohmann::json::exception& e) {
-        std::cerr << "[Erreur JSON] Impossible de parser le texte : " << e.what() << "\n";
-    }
-}
 
 
 static int generate_response(mtmd_cli_context & ctx, int n_predict, bool json_out = false) {
@@ -339,29 +286,64 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
     return 0;
 }
 
-std::string loadStudent(const std::string& path) {
-    std::string result{};
-    try {
-        if (std::filesystem::exists(path) && std::filesystem::is_directory(path)) {
-            for (const auto& entry : std::filesystem::recursive_directory_iterator(path)) {
-                std::ifstream ifs(entry.path());
-                std::stringstream buffer;
-                buffer << ifs.rdbuf();
-                if (std::filesystem::is_regular_file(entry)) {
-                    std::string relative_name = entry.path().lexically_relative(path).c_str();
-                    const bool is_theory = entry.path().extension() == ".txt";
-                    const std::string section = is_theory ? "THEORIE" : "PRATIQUE";
-                    result = result + "######BEGIN FILE [" + section + "] \"" + relative_name + "\"\n" + buffer.str() + "\n######END FILE [" + section + "] \"" + relative_name + "\"\n";
-                    std::cout << "Loaded " << relative_name << std::endl;
-                }
-            }
-        } else {
-            std::cerr << "Le chemin spécifié n'existe pas ou n'est pas un dossier." << std::endl;
-        }
-    } catch (const std::filesystem::filesystem_error& e) {
-        std::cerr << "Erreur : " << e.what() << std::endl;
+static bool load_script_lines_from_file(const std::string & path, std::vector<std::string> & out_lines) {
+    std::ifstream ifs(path);
+    if (!ifs.is_open()) {
+        LOG_ERR("ERR: Unable to open --line-file '%s'\n", path.c_str());
+        return false;
     }
-    return result;
+
+    std::string line;
+    while (std::getline(ifs, line)) {
+        out_lines.push_back(line);
+    }
+    return true;
+}
+
+static bool parse_scripted_lines_from_argv(int argc, char ** argv, std::vector<std::string> & scripted_lines, std::vector<char *> & filtered_argv) {
+    filtered_argv.clear();
+    filtered_argv.reserve(argc);
+    filtered_argv.push_back(argv[0]);
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+
+        if (arg == "--line") {
+            if (i + 1 >= argc) {
+                LOG_ERR("ERR: Missing value after --line\n");
+                return false;
+            }
+            scripted_lines.emplace_back(argv[++i]);
+            continue;
+        }
+
+        if (string_starts_with(arg, "--line=")) {
+            scripted_lines.emplace_back(arg.substr(7));
+            continue;
+        }
+
+        if (arg == "--line-file") {
+            if (i + 1 >= argc) {
+                LOG_ERR("ERR: Missing path after --line-file\n");
+                return false;
+            }
+            if (!load_script_lines_from_file(argv[++i], scripted_lines)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (string_starts_with(arg, "--line-file=")) {
+            if (!load_script_lines_from_file(arg.substr(12), scripted_lines)) {
+                return false;
+            }
+            continue;
+        }
+
+        filtered_argv.push_back(argv[i]);
+    }
+
+    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -373,9 +355,20 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MTMD, show_additional_info)) {
+    std::vector<std::string> scripted_lines;
+    std::vector<char *> filtered_argv;
+    if (!parse_scripted_lines_from_argv(argc, argv, scripted_lines, filtered_argv)) {
         return 1;
     }
+
+    const int filtered_argc = (int) filtered_argv.size();
+
+    if (!common_params_parse(filtered_argc, filtered_argv.data(), params, LLAMA_EXAMPLE_MTMD, show_additional_info)) {
+        return 1;
+    }
+
+    params.cache_type_k = GGML_TYPE_Q8_0;
+    params.cache_type_v = GGML_TYPE_Q8_0;
 
     mtmd_helper_log_set(common_log_default_callback, nullptr);
 
@@ -410,12 +403,14 @@ int main(int argc, char ** argv) {
 
     auto eval_system_prompt_if_present = [&] {
         if (params.system_prompt.empty()) {
+            LOG("no sys promop");
             return 0;
         }
 
         common_chat_msg msg;
         msg.role = "system";
         msg.content = params.system_prompt;
+        LOG("SYS  %s", msg.content);
         return eval_message(ctx, msg);
     };
 
@@ -428,8 +423,6 @@ int main(int argc, char ** argv) {
     ctx.n_keep = ctx.n_past;
 
     bool json_out = string_starts_with(params.sampling.grammar.grammar, "#custom");
-
-    LOG("%s\n", params.sampling.grammar.grammar.c_str());
 
     LOG("\n Running in chat mode, available commands:");
     LOG("\n   /pdf <path>    load pdf");
@@ -446,9 +439,19 @@ int main(int argc, char ** argv) {
     std::string content;
     bool is_first_response = true;
     std::vector<common_chat_msg> keep_chat_history;
+    const bool scripted_mode = !scripted_lines.empty();
+    size_t scripted_idx = 0;
+
+    if (scripted_mode) {
+        LOG("Scripted input mode enabled: %zu line(s)\n", scripted_lines.size());
+    }
 
     
     while (!g_is_interrupted) {
+        if (scripted_mode && scripted_idx >= scripted_lines.size()) {
+            break;
+        }
+
         /* autre que 1ere reponse : partie dynamique qui est supprimée a chaque fois
         KV : [STATIC][DYNAMIC]
                         ^--------^
@@ -462,12 +465,19 @@ int main(int argc, char ** argv) {
         }
 
         g_is_generating = false;
-        LOG("\n> ");
-        console::set_display(DISPLAY_TYPE_USER_INPUT);
         std::string line;
-        console::readline(line, false);
-        if (g_is_interrupted) break;
-        console::set_display(DISPLAY_TYPE_RESET);
+
+        if (scripted_mode) {
+            line = scripted_lines[scripted_idx++];
+            LOG("\n> %s\n", line.c_str());
+        } else {
+            LOG("\n> ");
+            console::set_display(DISPLAY_TYPE_USER_INPUT);
+            console::readline(line, false);
+            if (g_is_interrupted) break;
+            console::set_display(DISPLAY_TYPE_RESET);
+        }
+
         line = string_strip(line);
         
         if (line.empty()) continue;
@@ -487,17 +497,22 @@ int main(int argc, char ** argv) {
         }
 
         g_is_generating = true;
-        bool is_image = line == "/image" || line.find("/image ") == 0;
-        bool is_audio = line == "/audio" || line.find("/audio ") == 0;
-        bool is_pdf   = line == "/pdf"   || line.find("/pdf ")   == 0;
-        bool is_txt   = line == "/txt"   || line.find("/txt ")   == 0;
-        bool is_student   = line == "/student"   || line.find("/student ")   == 0;
+        bool is_image   = line == "/image"   || line.find("/image ")   == 0;
+        bool is_audio   = line == "/audio"   || line.find("/audio ")   == 0;
+        bool is_pdf     = line == "/pdf"     || line.find("/pdf ")     == 0;
+        bool is_txt     = line == "/txt"     || line.find("/txt ")     == 0;
+        bool is_student = line == "/student" || line.find("/student ") == 0;
 
         if(is_student) {
             std::string dir_exam_student = string_strip(line.substr(9));
-            content = "Corrige chaque question de l'examen, toutes les parties, tous les exercices, toutes les questions. Réponds dans un format JSON strict : {\"table\" : {\"x.y.zz\" : {\"grade\" : \"a/b\", \"comment\" : \"...\"}, \"x.y.zz\" : {...}}}. Ici, x représente le numéro de partie, y le numéro de l'exercice d'une certaine partie, et zz le numéro de question (01, 02, ..., 10, 12, etc). Si une partie a uniquement des questions et non des exercices, considère que le numéro d'exercice est 0, par conséquent les numéros de questions seront fidèles à celles du sujet (01, 02, 03, etc). Au niveau de la clé \"grade\", donne une note pour la question. Cette note est un ratio, soit des tiers (0/3, 1/3, 2/3, 3/3), soit des quarts (0/4, 1/4, 2/4, 3/4, 4/4). Choisis le ratio le plus adapté à la validité de la réponse de l'étudiant. Enfin, donne un petit commentaire dans la clé \"comment\". N'oublie pas que c'est toi le prof de C++, l'expert." +
-                      loadStudent(dir_exam_student) +
-                      "\n\nRéponds avec JSON valide et complet:";
+            content = "Corrige chaque question de l'examen. "
+                      "Chaque question (au format x.y.zz que tu connais deja) est une clé contenant :"
+                      "- une clé \"grade\" : une note pour la question (ratio 0/3 à 3/3 ou 0/4 à 4/4). "
+                      "- une clé \"points\", qui est le nombre de points de l'exercice (de la consigne, tu l'avais noté au prompt précédent)"
+                      "- une clé \"comment\" : un commentaire sur la question.\n"
+                      "Voici la copie :\n" + loadStudent(dir_exam_student) +
+                      "\n\nRÈGLE FORMAT : Réfléchis étape par étape pour chaque question. Quand tu as fini de corriger, écris le symbole ~ puis génère ton JSON strict avec la clé \"table\"."
+                      "\nExemple :\n<tes pensées...>\n~\n{\"table\": {\"1.0.01\": {\"grade\": \"...\", \"points\": \"...\", \"comment\": \"...\"}}}";
         }
         
         else if (is_image || is_audio || is_pdf || is_txt) {
@@ -537,9 +552,15 @@ int main(int argc, char ** argv) {
                         LOG_ERR("ERR: Echec du chargement de l'image '%s'\n", fname_str.c_str());
                     }
                 }
-                content = "Tu es un professeur de C++ très exigeant. Tu t'apprêtes à corriger des copies. Voici le sujet de l'examen :\n" 
+                content = "Tu t'apprêtes à corriger des copies. Voici le sujet de l'examen :\n" 
                             + content + 
-                            "\nAnalyse ce document pour t'en imprégner. Réponds en une seule phrase rapide avec la clé \"understanding\".";
+                            "\nAnalyse ce document avec la plus grande attention et identifie TOUTES les questions pour lesquelles l'étudiant devra fournir une réponse.\n"
+                            "génère un JSON avec UNIQUEMENT la clé \"understanding\".\n"
+                            "La clé \"understanding\" doit être un dictionnaire où chaque clé est l'identifiant de la question au format x.y.zz -> x le numéro de partie selon l'ordre (ex: théorique =1, pratique = 2), y le numéro d'exercice, zz le numéro de question. ex: \"1.0.01\", et la valeur est un objet contenant \"title\" (Partie et Exercice), \"points\" (le nombre en format texte, ex: \"1.5\"), et \"resume\" (un bref résumé des attendus).\n"
+                            "Exemple attendu :\n"
+                            "<tes pensées...>\n"
+                            "~\n"
+                            "{\"understanding\": {\"1.0.01\": {\"title\": \"Partie 1 - Question 01\", \"points\": \"1.5\", \"resume\": \"Concept de polymorphisme\"}}}";
             }
             else if (ctx.load_media(media_path)) {
                 LOG("%s %s loaded\n", media_path.c_str(), is_image ? "image" : "audio");
@@ -567,6 +588,7 @@ int main(int argc, char ** argv) {
         ctx.smpl = common_sampler_init(ctx.model, params.sampling);
 
         if (generate_response(ctx, n_predict, json_out)) return 1;
+        llama_perf_context_print(ctx.lctx);
 
         // le premier prompt est le prompt "statique"
         if (is_first_response) {
